@@ -233,8 +233,8 @@ curl "http://localhost:8080/api/reports/daily-sales?date=2026-11-26"
 
 | Phase | Scope | Time |
 |---|---|---|
-| **Part 0** | Repo layout, Docker Compose, Postgres schema & reconciled seed data | ~0.5 hrs |
-| **Part 1** | Go API (products, stock movements, atomic orders, cancel) + 9 integration & concurrency tests | ~1.5 hrs |
-| **Part 2** | React + strict TypeScript UI, single API client, all 5 screens/flows + 13 Vitest tests | ~1.5 hrs |
-| **Part 3** | End-to-end verification, `README.md` documentation, `curl` examples & review | ~0.5 hrs |
-| **Total** | | **~4.0 hrs** |
+| **Part 0** | Requirement analysis, repo layout, Docker Compose, Postgres schema & reconciled seed data | ~0.75 hrs |
+| **Part 1** | Go API (products, stock movements, atomic orders, cancel) + integration & concurrency tests | ~2.0 hrs |
+| **Part 2** | React + strict TypeScript UI, single API client, all 5 screens/flows + Vitest tests | ~1.75 hrs |
+| **Part 3 & Bonus** | `Idempotency-Key`, Daily Sales report & card, browser testing, understanding & `README.md` | ~1.5 hrs |
+| **Total** | | **~6.0 hrs** |
