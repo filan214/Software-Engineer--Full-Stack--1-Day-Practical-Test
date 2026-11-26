@@ -107,6 +107,14 @@ export interface OrdersListResponse {
   data: SalesOrder[];
 }
 
+export interface DailySalesReport {
+  date: string;
+  orders_count: number;
+  cancelled_count: number;
+  total_revenue: number;
+  items_sold: number;
+}
+
 export type ApiErrorCode =
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'

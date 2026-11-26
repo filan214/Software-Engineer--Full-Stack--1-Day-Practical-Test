@@ -97,10 +97,12 @@ What is tested in `backend/internal/handler/api_test.go`:
 - Order pre-write validation (`400` on empty customer, empty items, `qty <= 0`, duplicate SKUs, unknown SKU)
 - Server-side pricing (ignores client-supplied `unit_price`/`total`) and full multi-item atomic rollback on `409`
 - Order cancellation restoring stock & blocking double-cancel (`409`)
-- **Concurrency tests:**
+- **Concurrency & Idempotency tests:**
   - 20 concurrent orders competing for 5 units of the same SKU → exactly 5 succeed (`201`), 15 conflict (`409`), final stock `0`, ledger reconciled
   - 20 concurrent overlapping multi-SKU orders in opposite SKU orders → 0 deadlocks, exact reconciliation
   - 10 concurrent cancellations of the same order → exactly 1 succeeds (`200`), 9 conflict (`409`), stock restored once
+  - Sequential & 10-way concurrent retries sharing the same `Idempotency-Key` → all return the exact same order ID (`Idempotent-Replayed: true`), stock deducted once
+- **Daily sales report tests:** verifies `CREATED` vs `CANCELLED` aggregation and `400` on invalid date format
 
 ### Frontend (Typecheck, Vitest Unit Tests & Build)
 
@@ -165,9 +167,10 @@ curl http://localhost:8080/api/products/1/movements
 ### Sales Orders & Cancellation
 
 ```bash
-# Create order (201; unit_price & total computed strictly server-side)
-curl -X POST http://localhost:8080/api/orders \
+# Create order with Idempotency-Key (retrying with same key never double-orders)
+curl -i -X POST http://localhost:8080/api/orders \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-retry-demo-001" \
   -d '{"customer":"PT Karya Mandiri","items":[{"sku":"SKU-001","qty":2},{"sku":"SKU-003","qty":5}]}'
 
 # Create order with insufficient stock on 2nd item -> 409 (rolls back entire tx; zero stock changed)
@@ -183,6 +186,9 @@ curl "http://localhost:8080/api/orders?limit=20"
 
 # Cancel order (200 restores stock; repeating returns 409 ORDER_ALREADY_CANCELLED)
 curl -X POST http://localhost:8080/api/orders/1/cancel
+
+# Daily sales report (defaults to today if date is omitted)
+curl "http://localhost:8080/api/reports/daily-sales?date=2026-11-26"
 ```
 
 ---
@@ -207,13 +213,16 @@ curl -X POST http://localhost:8080/api/orders/1/cancel
    - Configured Vite's `/api` dev proxy (`vite.config.ts`) plus backend CORS middleware (`middleware.go`) so dev works smoothly both via proxy and direct calls.
    - Summary cards read from `GET /api/products/summary` instead of slicing the current paginated page, keeping totals accurate across pagination and filters.
 
+6. **Idempotent order creation (`Idempotency-Key`) & Daily Sales report:**
+   - `POST /api/orders` accepts an optional `Idempotency-Key` header (sent automatically per order draft by the frontend). Inside the transaction, `pg_advisory_xact_lock(hashtext(key))` serializes concurrent retries sharing the exact same key before touching stock, backed by a `UNIQUE` constraint on `sales_orders.idempotency_key`. Replays return the original order with `Idempotent-Replayed: true` and zero additional stock deduction.
+   - `GET /api/reports/daily-sales?date=YYYY-MM-DD` aggregates non-cancelled revenue, order count, cancelled count, and items sold using an index-friendly `[dayStart, dayEnd)` range query, powering the Daily Sales summary card.
+
 ---
 
 ## What I Would Improve With More Time
 
-- **Idempotency keys (`Idempotency-Key` header on `POST /api/orders`)** stored in a dedicated table with request hash validation so network retries never create duplicate orders.
 - **Full-stack `docker-compose.yml`** with multi-stage Dockerfiles for the Go API and static Nginx-served React frontend so a single `docker compose up` boots the entire stack.
-- **Daily sales reporting (`GET /api/reports/daily-sales?date=`)** with timezone-aware business-day bucketing and a dedicated dashboard card.
+- **Request-payload fingerprint check on `Idempotency-Key`** (returning `422`/`409` if a client accidentally reuses the same key with a different order payload).
 - **Versioned SQL migrations** (e.g., `golang-migrate` or `goose`) applied on API startup instead of relying solely on Postgres's first-boot `/docker-entrypoint-initdb.d`.
 - **Authentication, RBAC & audit actors** (`created_by` on movements and orders) so supervisors can trace who performed each adjustment or cancellation.
 - **Playwright end-to-end tests** automating the full browser flows (search, `409` modal feedback, order creation, and cancel stock restoration).

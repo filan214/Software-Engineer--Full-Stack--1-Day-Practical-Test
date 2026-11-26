@@ -1,4 +1,4 @@
-import type { ProductSummary } from '../api/types';
+import type { DailySalesReport, ProductSummary } from '../api/types';
 import { formatIDR } from '../utils/format';
 
 interface SummaryCardsProps {
@@ -6,6 +6,10 @@ interface SummaryCardsProps {
   loading: boolean;
   error: string | null;
   onRetry: () => void;
+  dailySales: DailySalesReport | null;
+  dailySalesLoading: boolean;
+  dailySalesDate: string;
+  onDailySalesDateChange: (date: string) => void;
 }
 
 export function SummaryCards({
@@ -13,6 +17,10 @@ export function SummaryCards({
   loading,
   error,
   onRetry,
+  dailySales,
+  dailySalesLoading,
+  dailySalesDate,
+  onDailySalesDateChange,
 }: SummaryCardsProps) {
   if (error) {
     return (
@@ -49,7 +57,7 @@ export function SummaryCards({
         <div className="summary-card-label">Total Stock Value</div>
         <div className="summary-card-value">
           {loading || !summary ? (
-            <span className="skeleton" style={{ width: 140, height: 26 }} />
+            <span className="skeleton" style={{ width: 130, height: 26 }} />
           ) : (
             formatIDR(summary.total_stock_value)
           )}
@@ -65,6 +73,35 @@ export function SummaryCards({
           {loading || !summary ? <span className="skeleton" style={{ width: 64, height: 26 }} /> : summary.low_stock_count}
         </div>
         <div className="summary-card-sub">Stock ≤ 10 units</div>
+      </div>
+
+      <div className="summary-card">
+        <div className="summary-card-header">
+          <span className="summary-card-label">Daily Sales</span>
+          <input
+            type="date"
+            className="summary-date-input"
+            aria-label="Daily sales date"
+            value={dailySalesDate}
+            onChange={(e) => {
+              if (e.target.value) {
+                onDailySalesDateChange(e.target.value);
+              }
+            }}
+          />
+        </div>
+        <div className="summary-card-value">
+          {dailySalesLoading || !dailySales ? (
+            <span className="skeleton" style={{ width: 120, height: 26 }} />
+          ) : (
+            formatIDR(dailySales.total_revenue)
+          )}
+        </div>
+        <div className="summary-card-sub">
+          {dailySalesLoading || !dailySales
+            ? 'Loading report...'
+            : `${dailySales.orders_count} order${dailySales.orders_count === 1 ? '' : 's'} · ${dailySales.items_sold} item${dailySales.items_sold === 1 ? '' : 's'} sold`}
+        </div>
       </div>
     </section>
   );

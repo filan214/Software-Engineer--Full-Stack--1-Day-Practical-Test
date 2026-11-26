@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, isApiClientError } from './api/client';
 import type {
+  DailySalesReport,
   Product,
   ProductFilter,
   ProductSummary,
@@ -15,6 +16,7 @@ import { ProductFormModal } from './components/ProductFormModal';
 import { ProductsTable } from './components/ProductsTable';
 import { SummaryCards } from './components/SummaryCards';
 import { useDebounce } from './hooks/useDebounce';
+import { formatDateInput } from './utils/format';
 
 type ActiveTab = 'products' | 'orders';
 const PAGE_LIMIT = 10;
@@ -37,10 +39,15 @@ export function App() {
   // Catalog for order creation selector (up to 100 SKUs)
   const [catalogProducts, setCatalogProducts] = useState<Product[]>([]);
 
-  // Summary cards state
+  // Summary cards & daily sales report state
   const [summary, setSummary] = useState<ProductSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [dailySalesDate, setDailySalesDate] = useState<string>(() =>
+    formatDateInput(),
+  );
+  const [dailySales, setDailySales] = useState<DailySalesReport | null>(null);
+  const [dailySalesLoading, setDailySalesLoading] = useState(true);
 
   // Orders state
   const [orders, setOrders] = useState<SalesOrder[]>([]);
@@ -127,6 +134,27 @@ export function App() {
     return () => controller.abort();
   }, [loadSummary, refreshToken]);
 
+  // Fetch daily sales report for selected date
+  useEffect(() => {
+    const controller = new AbortController();
+    setDailySalesLoading(true);
+    api
+      .getDailySales(dailySalesDate, controller.signal)
+      .then((report) => setDailySales(report))
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
+        setDailySales(null);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setDailySalesLoading(false);
+        }
+      });
+    return () => controller.abort();
+  }, [dailySalesDate, refreshToken]);
+
   // Fetch full catalog for the Create Order dropdown
   useEffect(() => {
     const controller = new AbortController();
@@ -195,6 +223,10 @@ export function App() {
         loading={summaryLoading}
         error={summaryError}
         onRetry={() => void loadSummary()}
+        dailySales={dailySales}
+        dailySalesLoading={dailySalesLoading}
+        dailySalesDate={dailySalesDate}
+        onDailySalesDateChange={setDailySalesDate}
       />
 
       <nav className="nav-tabs" aria-label="Main sections">

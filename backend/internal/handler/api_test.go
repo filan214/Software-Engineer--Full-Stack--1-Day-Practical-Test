@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -641,5 +642,134 @@ func TestConcurrentOrderCancelOnlyRestoresOnce(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT stock FROM products WHERE id = $1`, p.ID).Scan(&stock)
 	if stock != 10 {
 		t.Fatalf("expected stock=10 (restored exactly once), got %d", stock)
+	}
+}
+
+func TestOrderIdempotencyKeySequentialAndConcurrentRetries(t *testing.T) {
+	pool, router := setupTestEnv(t)
+	ctx := context.Background()
+
+	p := createProductHelper(t, router, "SKU-IDEMP", "Idempotent Scanner", 250000, true)
+	adjustStockHelper(t, router, p.ID, "in", 10, "init")
+
+	// Sequential retry with same Idempotency-Key -> same order ID, stock deducted only once
+	sendWithKey := func(key string, qty int) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"customer":"Retry Co","items":[{"sku":"SKU-IDEMP","qty":%d}]}`, qty)
+		req := httptest.NewRequest(http.MethodPost, "/api/orders", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := sendWithKey("idem-seq-1", 4)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first request failed: %d %s", first.Code, first.Body.String())
+	}
+	if first.Header().Get("Idempotent-Replayed") != "" {
+		t.Fatalf("expected no replay header on first call")
+	}
+	var order1 model.SalesOrder
+	_ = json.Unmarshal(first.Body.Bytes(), &order1)
+
+	second := sendWithKey("idem-seq-1", 4)
+	if second.Code != http.StatusCreated {
+		t.Fatalf("retry request failed: %d %s", second.Code, second.Body.String())
+	}
+	if second.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("expected Idempotent-Replayed: true on retry")
+	}
+	var order2 model.SalesOrder
+	_ = json.Unmarshal(second.Body.Bytes(), &order2)
+	if order1.ID != order2.ID || order1.Total != order2.Total {
+		t.Fatalf("expected identical replayed order, got %d vs %d", order1.ID, order2.ID)
+	}
+
+	// Now stock remaining is 6. Fire 10 concurrent retries with the EXACT SAME key for qty 6:
+	// All 10 must return 201 with the same order ID (never 409, never double-deduct!).
+	const workers = 10
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	codes := make([]int, workers)
+	orderIDs := make([]int, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			rec := sendWithKey("idem-concurrent-6", 6)
+			codes[idx] = rec.Code
+			var o model.SalesOrder
+			if err := json.Unmarshal(rec.Body.Bytes(), &o); err == nil {
+				orderIDs[idx] = o.ID
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < workers; i++ {
+		if codes[i] != http.StatusCreated {
+			t.Fatalf("worker %d expected 201, got %d", i, codes[i])
+		}
+		if orderIDs[i] == 0 || orderIDs[i] != orderIDs[0] {
+			t.Fatalf("worker %d got mismatched order ID %d vs %d", i, orderIDs[i], orderIDs[0])
+		}
+	}
+
+	var finalStock, orderCount int
+	_ = pool.QueryRow(ctx, `SELECT stock FROM products WHERE id = $1`, p.ID).Scan(&finalStock)
+	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM sales_orders`).Scan(&orderCount)
+	if finalStock != 0 || orderCount != 2 {
+		t.Fatalf("expected finalStock=0 and exactly 2 total orders, got stock=%d orders=%d", finalStock, orderCount)
+	}
+}
+
+func TestDailySalesReport(t *testing.T) {
+	_, router := setupTestEnv(t)
+
+	p1 := createProductHelper(t, router, "SKU-R1", "Report Item 1", 100000, true)
+	p2 := createProductHelper(t, router, "SKU-R2", "Report Item 2", 250000, true)
+	adjustStockHelper(t, router, p1.ID, "in", 20, "init")
+	adjustStockHelper(t, router, p2.ID, "in", 20, "init")
+
+	// Order 1 (stays CREATED): 3*100k + 2*250k = 800,000, items = 5
+	o1Rec := doJSON(t, router, http.MethodPost, "/api/orders", map[string]any{
+		"customer": "Daily Buyer A",
+		"items": []map[string]any{
+			{"sku": "SKU-R1", "qty": 3},
+			{"sku": "SKU-R2", "qty": 2},
+		},
+	})
+	if o1Rec.Code != http.StatusCreated {
+		t.Fatalf("order 1 failed: %d", o1Rec.Code)
+	}
+
+	// Order 2 (will be CANCELLED): should count in cancelled_count, NOT in total_revenue/items_sold
+	o2Rec := doJSON(t, router, http.MethodPost, "/api/orders", map[string]any{
+		"customer": "Daily Buyer B",
+		"items":    []map[string]any{{"sku": "SKU-R1", "qty": 4}},
+	})
+	var o2 model.SalesOrder
+	_ = json.Unmarshal(o2Rec.Body.Bytes(), &o2)
+	doJSON(t, router, http.MethodPost, fmt.Sprintf("/api/orders/%d/cancel", o2.ID), nil)
+
+	today := time.Now().Format("2006-01-02")
+	repRec := doJSON(t, router, http.MethodGet, "/api/reports/daily-sales?date="+today, nil)
+	if repRec.Code != http.StatusOK {
+		t.Fatalf("daily sales report failed: %d %s", repRec.Code, repRec.Body.String())
+	}
+	var report model.DailySalesReport
+	_ = json.Unmarshal(repRec.Body.Bytes(), &report)
+	if report.Date != today || report.OrdersCount != 1 || report.CancelledCount != 1 || report.TotalRevenue != 800000 || report.ItemsSold != 5 {
+		t.Fatalf("unexpected daily sales report: %+v", report)
+	}
+
+	// Invalid date -> 400
+	badRec := doJSON(t, router, http.MethodGet, "/api/reports/daily-sales?date=not-a-date", nil)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid date, got %d", badRec.Code)
 	}
 }

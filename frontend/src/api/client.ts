@@ -4,6 +4,7 @@ import type {
   ApiErrorEnvelope,
   CreateOrderPayload,
   CreateProductPayload,
+  DailySalesReport,
   MovementsListResponse,
   OrdersListResponse,
   Product,
@@ -198,9 +199,17 @@ export const api = {
     return request<SalesOrder>(`/orders/${id}`, { signal });
   },
 
-  createOrder(payload: CreateOrderPayload): Promise<SalesOrder> {
+  createOrder(
+    payload: CreateOrderPayload,
+    idempotencyKey?: string,
+  ): Promise<SalesOrder> {
+    const headers: Record<string, string> = {};
+    if (idempotencyKey && idempotencyKey.trim().length > 0) {
+      headers['Idempotency-Key'] = idempotencyKey.trim();
+    }
     return request<SalesOrder>('/orders', {
       method: 'POST',
+      headers,
       body: JSON.stringify(payload),
     });
   },
@@ -208,6 +217,16 @@ export const api = {
   cancelOrder(id: number): Promise<SalesOrder> {
     return request<SalesOrder>(`/orders/${id}/cancel`, {
       method: 'POST',
+    });
+  },
+
+  getDailySales(
+    date?: string,
+    signal?: AbortSignal,
+  ): Promise<DailySalesReport> {
+    const query = buildQuery({ date });
+    return request<DailySalesReport>(`/reports/daily-sales${query}`, {
+      signal,
     });
   },
 };

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 
 	"stockflow/backend/internal/service"
 )
@@ -39,15 +40,19 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	order, err := h.orders.Create(r.Context(), service.CreateOrderInput{
-		Customer: req.Customer,
-		Items:    items,
+	result, err := h.orders.Create(r.Context(), service.CreateOrderInput{
+		Customer:       req.Customer,
+		Items:          items,
+		IdempotencyKey: strings.TrimSpace(r.Header.Get("Idempotency-Key")),
 	})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, order)
+	if result.Replayed {
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	writeJSON(w, http.StatusCreated, result.Order)
 }
 
 func (h *OrderHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -93,4 +98,13 @@ func (h *OrderHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, order)
+}
+
+func (h *OrderHandler) DailySalesReport(w http.ResponseWriter, r *http.Request) {
+	report, err := h.orders.DailySalesReport(r.Context(), r.URL.Query().Get("date"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }

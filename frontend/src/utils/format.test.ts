@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatIDR, formatRelativeTime } from './format';
+import { formatDateInput, formatIDR, formatRelativeTime } from './format';
 
 describe('formatIDR', () => {
   it('formats zero and positive integers with dot thousand separators', () => {
@@ -30,5 +30,12 @@ describe('formatRelativeTime', () => {
 
   it('handles invalid timestamps gracefully', () => {
     expect(formatRelativeTime('not-a-date', now)).toBe('Invalid date');
+  });
+});
+
+describe('formatDateInput', () => {
+  it('formats local date with zero-padded month and day', () => {
+    expect(formatDateInput(new Date(2026, 0, 5))).toBe('2026-01-05');
+    expect(formatDateInput(new Date(2026, 10, 26))).toBe('2026-11-26');
   });
 });

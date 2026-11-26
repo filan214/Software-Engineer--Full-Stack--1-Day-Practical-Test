@@ -26,6 +26,13 @@ function createEmptyRow(defaultSku = ''): OrderItemDraft {
   return { id: `row-${rowCounter}`, sku: defaultSku, qty: '1' };
 }
 
+function createIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `ord-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function CreateOrderPanel({
   products,
   onOrderCreated,
@@ -35,6 +42,9 @@ export function CreateOrderPanel({
   const [items, setItems] = useState<OrderItemDraft[]>(() => [
     createEmptyRow(products[0]?.sku ?? ''),
   ]);
+  const [idempotencyKey, setIdempotencyKey] = useState<string>(() =>
+    createIdempotencyKey(),
+  );
   const [saving, setSaving] = useState(false);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [conflict, setConflict] = useState<StockConflict | null>(null);
@@ -64,6 +74,7 @@ export function CreateOrderPanel({
     setItems((prev) =>
       prev.map((row) => (row.id === id ? { ...row, ...patch } : row)),
     );
+    setIdempotencyKey(createIdempotencyKey());
     setConflict(null);
   }
 
@@ -71,10 +82,12 @@ export function CreateOrderPanel({
     const usedSkus = new Set(items.map((i) => i.sku));
     const nextProduct = products.find((p) => !usedSkus.has(p.sku));
     setItems((prev) => [...prev, createEmptyRow(nextProduct?.sku ?? '')]);
+    setIdempotencyKey(createIdempotencyKey());
   }
 
   function removeRow(id: string) {
     setItems((prev) => prev.filter((row) => row.id !== id));
+    setIdempotencyKey(createIdempotencyKey());
     setConflict(null);
   }
 
@@ -92,10 +105,11 @@ export function CreateOrderPanel({
     setValidationErrors([]);
     setSaving(true);
     try {
-      const order = await api.createOrder(validation.data);
+      const order = await api.createOrder(validation.data, idempotencyKey);
       setCreatedOrder(order);
       setCustomer('');
       setItems([createEmptyRow(products[0]?.sku ?? '')]);
+      setIdempotencyKey(createIdempotencyKey());
       onOrderCreated(order);
     } catch (err: unknown) {
       if (isApiClientError(err) && err.code === 'INSUFFICIENT_STOCK') {
@@ -218,7 +232,10 @@ export function CreateOrderPanel({
               className="field-input"
               placeholder="e.g. PT Karya Mandiri"
               value={customer}
-              onChange={(e) => setCustomer(e.target.value)}
+              onChange={(e) => {
+                setCustomer(e.target.value);
+                setIdempotencyKey(createIdempotencyKey());
+              }}
               disabled={saving}
             />
           </div>

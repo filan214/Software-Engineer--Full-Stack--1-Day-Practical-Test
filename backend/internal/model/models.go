@@ -59,3 +59,11 @@ type SalesOrderItem struct {
 	Qty         int    `json:"qty"`
 	UnitPrice   int    `json:"unit_price"`
 }
+
+type DailySalesReport struct {
+	Date           string `json:"date"`
+	OrdersCount    int    `json:"orders_count"`
+	CancelledCount int    `json:"cancelled_count"`
+	TotalRevenue   int64  `json:"total_revenue"`
+	ItemsSold      int    `json:"items_sold"`
+}

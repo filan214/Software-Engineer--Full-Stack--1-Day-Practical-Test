@@ -39,11 +39,12 @@ func NewRouter(pool *pgxpool.Pool, corsOrigin string) http.Handler {
 	mux.HandleFunc("POST /api/products/{id}/stock", productHandler.AdjustStock)
 	mux.HandleFunc("GET /api/products/{id}/movements", productHandler.ListMovements)
 
-	// Sales orders
+	// Sales orders & reports
 	mux.HandleFunc("GET /api/orders", orderHandler.List)
 	mux.HandleFunc("POST /api/orders", orderHandler.Create)
 	mux.HandleFunc("GET /api/orders/{id}", orderHandler.Get)
 	mux.HandleFunc("POST /api/orders/{id}/cancel", orderHandler.Cancel)
+	mux.HandleFunc("GET /api/reports/daily-sales", orderHandler.DailySalesReport)
 
 	return withRecovery(withRequestLogger(withCORS(corsOrigin, mux)))
 }

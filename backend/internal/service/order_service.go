@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,8 +29,14 @@ type CreateOrderItemInput struct {
 }
 
 type CreateOrderInput struct {
-	Customer string
-	Items    []CreateOrderItemInput
+	Customer       string
+	Items          []CreateOrderItemInput
+	IdempotencyKey string
+}
+
+type CreateOrderResult struct {
+	Order    model.SalesOrder
+	Replayed bool
 }
 
 type lockedProduct struct {
@@ -40,8 +47,9 @@ type lockedProduct struct {
 	Stock int
 }
 
-func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (model.SalesOrder, error) {
+func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (CreateOrderResult, error) {
 	customer := strings.TrimSpace(input.Customer)
+	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 
 	// 1. Validate everything before touching the database.
 	var details []string
@@ -80,7 +88,7 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 	}
 
 	if len(details) > 0 {
-		return model.SalesOrder{}, ErrValidation(strings.Join(details, "; "), details...)
+		return CreateOrderResult{}, ErrValidation(strings.Join(details, "; "), details...)
 	}
 
 	// Sort SKUs deterministically before acquiring FOR UPDATE locks to prevent deadlocks
@@ -93,9 +101,39 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return model.SalesOrder{}, fmt.Errorf("begin order tx: %w", err)
+		return CreateOrderResult{}, fmt.Errorf("begin order tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	var idempotencyKeyPtr *string
+	if idempotencyKey != "" {
+		idempotencyKeyPtr = &idempotencyKey
+		// Serialize concurrent retries sharing the exact same Idempotency-Key before touching stock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, idempotencyKey); err != nil {
+			return CreateOrderResult{}, fmt.Errorf("acquire idempotency lock: %w", err)
+		}
+
+		var existingOrder model.SalesOrder
+		err := tx.QueryRow(ctx, `
+			SELECT id, customer, status, total, created_at, cancelled_at
+			FROM sales_orders
+			WHERE idempotency_key = $1
+		`, idempotencyKey).Scan(
+			&existingOrder.ID, &existingOrder.Customer, &existingOrder.Status,
+			&existingOrder.Total, &existingOrder.CreatedAt, &existingOrder.CancelledAt,
+		)
+		if err == nil {
+			items, itemErr := s.fetchOrderItems(ctx, tx, existingOrder.ID)
+			if itemErr != nil {
+				return CreateOrderResult{}, itemErr
+			}
+			existingOrder.Items = items
+			return CreateOrderResult{Order: existingOrder, Replayed: true}, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return CreateOrderResult{}, fmt.Errorf("check idempotency key: %w", err)
+		}
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT id, sku, name, price, stock
@@ -105,7 +143,7 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 		FOR UPDATE
 	`, sortedSKUs)
 	if err != nil {
-		return model.SalesOrder{}, fmt.Errorf("lock products for order: %w", err)
+		return CreateOrderResult{}, fmt.Errorf("lock products for order: %w", err)
 	}
 
 	productsBySKU := make(map[string]lockedProduct, len(sortedSKUs))
@@ -113,13 +151,13 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 		var p lockedProduct
 		if err := rows.Scan(&p.ID, &p.SKU, &p.Name, &p.Price, &p.Stock); err != nil {
 			rows.Close()
-			return model.SalesOrder{}, fmt.Errorf("scan locked product: %w", err)
+			return CreateOrderResult{}, fmt.Errorf("scan locked product: %w", err)
 		}
 		productsBySKU[p.SKU] = p
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return model.SalesOrder{}, fmt.Errorf("iterate locked products: %w", err)
+		return CreateOrderResult{}, fmt.Errorf("iterate locked products: %w", err)
 	}
 	rows.Close()
 
@@ -131,7 +169,7 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 		}
 	}
 	if len(unknownDetails) > 0 {
-		return model.SalesOrder{}, ErrValidation(strings.Join(unknownDetails, "; "), unknownDetails...)
+		return CreateOrderResult{}, ErrValidation(strings.Join(unknownDetails, "; "), unknownDetails...)
 	}
 
 	// Decrement stock for all items atomically in one transaction with guarded UPDATEs.
@@ -144,29 +182,29 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 			WHERE id = $2 AND stock >= $1
 		`, item.Qty, p.ID)
 		if err != nil {
-			return model.SalesOrder{}, fmt.Errorf("decrement stock for %s: %w", p.SKU, err)
+			return CreateOrderResult{}, fmt.Errorf("decrement stock for %s: %w", p.SKU, err)
 		}
 		if tag.RowsAffected() == 0 {
 			// Rollback happens via defer: zero stock or order rows will be persisted.
-			return model.SalesOrder{}, ErrInsufficientStock(p.SKU, p.Stock)
+			return CreateOrderResult{}, ErrInsufficientStock(p.SKU, p.Stock)
 		}
 
 		total64 += int64(item.Qty) * int64(p.Price)
 		if total64 > math.MaxInt32 {
-			return model.SalesOrder{}, ErrValidation("order total exceeds maximum supported integer amount")
+			return CreateOrderResult{}, ErrValidation("order total exceeds maximum supported integer amount")
 		}
 	}
 
 	var order model.SalesOrder
 	err = tx.QueryRow(ctx, `
-		INSERT INTO sales_orders (customer, status, total)
-		VALUES ($1, 'CREATED', $2)
+		INSERT INTO sales_orders (customer, status, total, idempotency_key)
+		VALUES ($1, 'CREATED', $2, $3)
 		RETURNING id, customer, status, total, created_at, cancelled_at
-	`, customer, int(total64)).Scan(
+	`, customer, int(total64), idempotencyKeyPtr).Scan(
 		&order.ID, &order.Customer, &order.Status, &order.Total, &order.CreatedAt, &order.CancelledAt,
 	)
 	if err != nil {
-		return model.SalesOrder{}, fmt.Errorf("insert sales order: %w", err)
+		return CreateOrderResult{}, fmt.Errorf("insert sales order: %w", err)
 	}
 
 	note := fmt.Sprintf("Order #%d (%s)", order.ID, order.Customer)
@@ -183,7 +221,7 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 			&oi.ID, &oi.OrderID, &oi.SKU, &oi.Qty, &oi.UnitPrice,
 		)
 		if err != nil {
-			return model.SalesOrder{}, fmt.Errorf("insert sales order item: %w", err)
+			return CreateOrderResult{}, fmt.Errorf("insert sales order item: %w", err)
 		}
 		oi.ProductName = p.Name
 		order.Items = append(order.Items, oi)
@@ -192,15 +230,15 @@ func (s *OrderService) Create(ctx context.Context, input CreateOrderInput) (mode
 			INSERT INTO stock_movements (product_id, type, qty, note)
 			VALUES ($1, 'out', $2, $3)
 		`, p.ID, item.Qty, note); err != nil {
-			return model.SalesOrder{}, fmt.Errorf("insert order stock movement: %w", err)
+			return CreateOrderResult{}, fmt.Errorf("insert order stock movement: %w", err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return model.SalesOrder{}, fmt.Errorf("commit sales order: %w", err)
+		return CreateOrderResult{}, fmt.Errorf("commit sales order: %w", err)
 	}
 
-	return order, nil
+	return CreateOrderResult{Order: order, Replayed: false}, nil
 }
 
 func (s *OrderService) Get(ctx context.Context, id int) (model.SalesOrder, error) {
@@ -409,4 +447,46 @@ func (s *OrderService) queryOrderItems(ctx context.Context, q queryable, orderID
 		return nil, fmt.Errorf("iterate order items: %w", err)
 	}
 	return items, nil
+}
+
+func (s *OrderService) DailySalesReport(ctx context.Context, rawDate string) (model.DailySalesReport, error) {
+	dateStr := strings.TrimSpace(rawDate)
+	if dateStr == "" {
+		dateStr = time.Now().Format("2006-01-02")
+	}
+
+	dayStart, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
+	if err != nil {
+		return model.DailySalesReport{}, ErrValidation("Invalid date format; expected YYYY-MM-DD")
+	}
+	dayEnd := dayStart.AddDate(0, 0, 1)
+
+	report := model.DailySalesReport{Date: dateStr}
+	err = s.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'CREATED') AS orders_count,
+			COUNT(*) FILTER (WHERE status = 'CANCELLED') AS cancelled_count,
+			COALESCE(SUM(total::bigint) FILTER (WHERE status = 'CREATED'), 0) AS total_revenue
+		FROM sales_orders
+		WHERE created_at >= $1 AND created_at < $2
+	`, dayStart, dayEnd).Scan(
+		&report.OrdersCount,
+		&report.CancelledCount,
+		&report.TotalRevenue,
+	)
+	if err != nil {
+		return model.DailySalesReport{}, fmt.Errorf("daily sales summary: %w", err)
+	}
+
+	err = s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(i.qty), 0)
+		FROM sales_order_items i
+		JOIN sales_orders o ON o.id = i.order_id
+		WHERE o.status = 'CREATED' AND o.created_at >= $1 AND o.created_at < $2
+	`, dayStart, dayEnd).Scan(&report.ItemsSold)
+	if err != nil {
+		return model.DailySalesReport{}, fmt.Errorf("daily items sold: %w", err)
+	}
+
+	return report, nil
 }

@@ -24,6 +24,7 @@ CREATE TABLE sales_orders (
     customer TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'CREATED' CHECK (status IN ('CREATED', 'CANCELLED')),
     total INTEGER NOT NULL CHECK (total >= 0),
+    idempotency_key TEXT UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     cancelled_at TIMESTAMPTZ
 );
